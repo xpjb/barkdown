@@ -32,6 +32,7 @@ pub struct RichText {
     pub runs: Vec<Run>,
     pub mapping: Vec<Mapping>,
     pub links: Vec<Link>,
+    pub math: Option<crate::math::Expr>,
 }
 impl RichText {
     pub fn literal(source: &str) -> Self {
@@ -40,7 +41,7 @@ impl RichText {
         out
     }
     pub fn same_pixels(&self, other: &Self) -> bool {
-        self.text == other.text && self.runs == other.runs
+        self.text == other.text && self.runs == other.runs && self.math == other.math
     }
     pub fn source_byte(&self, byte: usize) -> usize {
         let i = self.mapping.partition_point(|m| m.display.end <= byte);
@@ -175,6 +176,7 @@ pub fn parse_cell(s: &str) -> RichText {
 fn parse_inner(s: &str, table: bool) -> RichText {
     let b = s.as_bytes();
     let codes = code_spans(s);
+    let maths = crate::math::regions(s, &codes);
     let mut links = Vec::new();
     let mut hidden = vec![false; b.len()];
     let mut opaque = vec![false; b.len()];
@@ -198,6 +200,7 @@ fn parse_inner(s: &str, table: bool) -> RichText {
         }
         mark(inner.clone(), CODE);
     }
+    for region in &maths { opaque[region.full.clone()].fill(true); }
     // Match brackets/parentheses once, outside code and backslash escapes. No
     // repeated suffix searches for adversarial unmatched '[[' / '(((' input.
     let mut bracket = Vec::new();
@@ -368,6 +371,7 @@ fn parse_inner(s: &str, table: bool) -> RichText {
     let mut counts = [0i32; 6];
     let mut event = 0;
     let mut out = RichText::default();
+    let mut math_index = 0;
     i = 0;
     while i < b.len() {
         while event < events.len() && events[event].0 <= i {
@@ -383,6 +387,28 @@ fn parse_inner(s: &str, table: bool) -> RichText {
             .iter()
             .enumerate()
             .fold(0, |f, (j, &n)| if n > 0 { f | (1 << j) } else { f });
+        while maths.get(math_index).is_some_and(|r| r.full.end <= i) { math_index += 1; }
+        if let Some(region) = maths.get(math_index).filter(|r| r.full.start == i) {
+            if let Some(expr) = crate::math::parse(&s[region.inner.clone()]) {
+                out.push(&expr.plain(), flags, region.inner.clone(), false);
+                if s[..region.full.start].trim().is_empty() && s[region.full.end..].trim().is_empty() {
+                    out.math = Some(expr);
+                }
+            } else { out.push(&s[region.full.clone()], flags, region.full.clone(), true); }
+            i = region.full.end;
+            continue;
+        }
+        // These are transport citation tokens, not Unicode prose or authored
+        // URLs. Do not invent a link from an opaque ID; retain the source and
+        // show explicitly that its citation metadata is unavailable.
+        if flags & CODE == 0 && s[i..].starts_with("\u{e200}cite\u{e202}") {
+            if let Some(end) = s[i..].find('\u{e201}') {
+                let end = i + end + '\u{e201}'.len_utf8();
+                out.push("[citation unavailable]", flags, i..end, false);
+                i = end;
+                continue;
+            }
+        }
         if table && b[i] == b'\\' && b.get(i + 1) == Some(&b'|') {
             out.push("|", flags, i..i + 2, false);
             i += 2;
@@ -437,6 +463,28 @@ fn parse_inner(s: &str, table: bool) -> RichText {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn math_and_citation_tokens_project_without_destroying_literal_code() {
+        for source in [r"\[P(\text{at least one lost})=1-(1-p)^n\]",
+            "[\nP(\\text{at least one lost})=1-(1-p)^n\n]",
+            "$$P(\\text{at least one lost})=1-(1-p)^n$$"] {
+            let rich = parse(source);
+            assert_eq!(rich.text, "P(at least one lost)=1-(1-p)ⁿ");
+            assert!(rich.math.is_some());
+            assert!(rich.mapping.iter().all(|m| source.get(m.source.clone()).is_some()));
+        }
+        let inline = parse(r"With \(x^2\) and $\alpha_1$.");
+        assert_eq!(inline.text, "With x² and α₁.");
+        assert!(inline.math.is_none());
+        assert_eq!(parse(r"`$x^2$` and \$5").text, "$x^2$ and $5");
+        assert_eq!(parse(r"\[\unsupported{x_1}\]").text, r"\[\unsupported{x_1}\]");
+        let token = "\u{e200}cite\u{e202}turn2view0\u{e201}";
+        let rich = parse(&format!("See {token}."));
+        assert_eq!(rich.text, "See [citation unavailable].");
+        assert!(rich.links.is_empty(), "never fabricate a source URL");
+        assert_eq!(parse(&format!("`{token}`")).text, token);
+    }
+
     #[test]
     fn nested_faces_projection_and_source_mapping() {
         let s = "A **bold _café_** &amp; `x*y` [link](https://x/(y))";

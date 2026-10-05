@@ -1,22 +1,14 @@
-# Experimental incremental Markdown engine
+# Barkdown model and projection contract
 
-This is the reusable part of **`markdown-editor`**, not a new responsibility of
-`TextService`. It is example-local while its dialect and API settle:
+The model remains independent of the window and GPU. It originated in Sanscale's
+Markdown editor example and is now the reusable model in Barkdown.
 
-- `mod.rs`: authoritative LF-based Rope, stable physical-line identities, block/
-  cell model, UTF-8 edits, streaming, bounded change history and work counters.
-- `parse.rs`: custom line-state block parser; no parser framework dependency.
-- `inline.rs`: immutable projected UTF-8, semantic runs, and explicit source maps.
-- `../preview.rs`: a separate, window-independent **sanscale adapter**. Takes font
-  handles, resolves spans, retains cell layouts/paint, and returns glyph draws
-  plus under/over rectangles. Does not discover fonts or own a window/pass.
-- `../fonts.rs`, the example executable and its sample files: demo/application
-  policy only. No part of this feature is added to `src/` or its runtime dependencies.
-
-This is not yet an importable/stable sanscale API. The intended extraction is an
-optional companion component, not making all text users depend on Markdown, Rope,
-font discovery, or UI infrastructure. Other consumers need not implement an editor:
-`Document` + `Preview` are also usable as the model/view for an agent message.
+- `mod.rs`: LF-based Rope, stable physical-line/cell IDs, streaming edits and change history.
+- `parse.rs`: line-state block parser.
+- `inline.rs`: immutable projected text, semantic runs, math and explicit source maps.
+- `../preview.rs`: consumer-font Sanscale adapter returning glyph draws and decorations.
+- `../syntax.rs`: shared, bounded fenced-code paint for previews and source editors.
+- `../math.rs`: bounded TeX-subset parser and native display-equation layout.
 
 ## Streaming and editing contract
 
@@ -81,10 +73,11 @@ Implemented:
 Not implemented: full CommonMark/GFM delimiter rules (including the rule of three),
 full Unicode punctuation classification (currently a heuristic),
 reference links/definitions, bare-URL autolinks, HTML interpretation, nested block
-containers, indented code blocks, footnotes, math, image loading, or embedded media.
+containers, indented code blocks, footnotes, full LaTeX, image loading, or embedded media.
 HTML is literal text, not executable content. Links are styled but passive; the
-example's click action locates source, not opening arbitrary URLs. Tabs do not gain
-real tab stops—the underlying text engine's existing limitation still applies.
+consumer owns activation policy. Tabs advance four space widths without changing
+source offsets; configurable column stops are not implemented. See the crate README
+for supported math/citation projection and syntax-language fallback behavior.
 
 ## What is incremental
 
@@ -154,7 +147,9 @@ view.release(&mut text); // release owned paint snapshots before discarding a vi
 ```
 
 The namespace reserves keys `(namespace << 32) | element_id`; use distinct
-nonzero, non-maximum namespaces for simultaneous views/other service clients.
+nonzero, non-maximum namespaces for each newly created view/other service client.
+Do not reuse a discarded view's namespace in the same TextService: its cached
+paragraph generations can remain resident. Reuse the Preview object instead.
 Font handles and a view remain local to one `TextService`, and handles must stay
 valid. Reusing a view for a different Document automatically reconciles ownership;
 shaping generations never reset to an old document's values. This prototype
@@ -171,34 +166,17 @@ Source mapping is explicit: projected segments point back into raw element input
 which points to stable line IDs + byte columns. Entity decoding, escapes, code
 trimming, line prefixes and hidden markup are not handled by subtracting a fixed
 number of delimiter bytes. The split-view demo uses these maps for click-to-source;
-preview selection/copy and bidirectional range mapping are future work.
+selection/copy use the same mappings. Standalone display equations are atomic
+selection objects rather than a second editable TeX cursor model.
 
 ## Exercise it
 
 ```sh
-cargo nextest run --example markdown-editor
-cargo nextest run --example markdown-editor --features perf-counters
-cargo run --release --example markdown-editor -- --dump
-cargo run --release --features perf-counters --example markdown-editor -- --dump --stream
-mkdir -p perf-results
-cargo run --release --example markdown-editor -- --bench > perf-results/markdown-cpu.json
+cargo nextest run --locked --all-features
+cargo check --locked --no-default-features
 ```
 
-With `perf-counters`, both dump modes also render a second completed GPU frame and
-assert zero shaping, flow, prepare calls and text-vertex uploads while recording
-real glyph draws. CPU tests cover palette changes, combined faces/graphemes,
-source mapping, row-height propagation, view/document replacement, lagged history,
-randomized layout reconciliation, and prefix/edit equivalence.
-
-`--bench` is a small **CPU-only diagnostic**, with 3 warmups and 11 samples over a
-2,000-row / three-column table. It checks append/edit work and real paint changes,
-and includes uncached widths and a full-parse control. Font discovery/setup are
-untimed. Source-location lookup is untimed for the cell edit; the full-parse control
-receives an already materialized source string. The main library's fingerprinted
-before/after suite is separate; do not treat this probe as end-to-end latency or
-compare instrumented durations against production builds.
-
-The UI is a prototype: no undo/redo, IME, bidi, unsaved-change confirmation,
-preview selection, or resizable split divider. F5 appends a demo reply rather than
-replacing the user's document; ordinary source edits pause that demo stream. There
-is no network connection or automatic save.
+Tests include incremental/cold parser and layout equivalence, source mapping,
+selection/copy, tables, code paint, streaming math and citation fallback. Headless
+GPU consumer regressions live in Tau and Compendium; library tests use included,
+licensed deterministic DejaVu fonts. No font discovery or example UI is required.

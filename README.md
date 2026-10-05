@@ -15,6 +15,21 @@ hidden inside the library. Consumers supply fonts and own link activation.
   Multiline strings/comments are parsed as a whole fence. Unchanged fences reuse
   paint; edited fences are rehighlighted within a 512 KiB / 16 KiB-per-line budget.
   Over-budget code remains plain and copyable. `--no-default-features` omits Syntect.
+- Math: `\(…\)`, `\[…\]`, `$…$`, `$$…$$`, plus standalone bracketed
+  equations containing TeX/script syntax (the LLM probability-example form).
+  Standalone equations get native positioned scripts, fractions and root rules;
+  inline math gets a readable Unicode projection. Supported commands include
+  `\text`, `\frac`, `\sqrt`, common Greek letters/operators and scripts.
+  This is **not full LaTeX**: no macros/environments/matrices or TeX execution.
+  Expressions are bounded to 4 KiB / 32 nesting levels. Unknown commands remain
+  literal, never silently omitted. Display equations are atomically selectable;
+  copy returns their readable text, while the Document retains exact TeX source.
+  Blank lines still separate Markdown paragraphs; display math must stay within
+  a paragraph. Actual code fences/code spans always stay literal.
+- Raw citation transport markers project to `[citation unavailable]` when no
+  source metadata is available; opaque IDs are never fabricated into links.
+- Tabs render with four spaces of advance in Sanscale, not tofu, retaining their
+  original source bytes/caret stops. Configurable tab stops are not implemented.
 - Explicit ownership: call `Preview::release` before discarding a view or clearing
   its text service. Font reloads, source edits and width changes have separate paths.
 
@@ -47,8 +62,8 @@ and baseline-relative underline fixes are retained. MIT OR Apache-2.0;
 both license texts are included. Deterministic DejaVu test fonts carry their own
 license in `tests/fonts/`; production fonts are supplied by each app.
 
-Sanscale is pinned to `8a290e9e121aa9992ea0e3b3de14188e3a2097f1` (master as
-verified October 5, 2026), including prepared-text residency fix `4325844`.
+Sanscale is pinned to `15ad1f03e17a368e2ff4f1b269f60bad13483638` (master as
+verified October 5, 2026), including prepared-text residency fix `4325844` and source-preserving tab advances.
 Consumers must use the same Git source/revision to share one TextService type.
 
 ## Checks

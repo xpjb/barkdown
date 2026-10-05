@@ -214,6 +214,7 @@ struct TextCache {
     fonts: Vec<FontSpan>,
     paint_spans: Vec<PaintSpan>,
     syntax_spans: Vec<PaintSpan>,
+    math: Option<crate::math::Layout>,
     paint: Option<PaintHandle>,
     handle: ShapedHandle,
     style: Style,
@@ -238,7 +239,7 @@ impl TextCache {
         self.handle = text
             .shape(BlockKey(key), &self.style, &keys, &source)
             .expect("Markdown adapter emits valid grapheme-aligned font spans");
-        self.height = text.measure(self.handle).height_em() * self.size;
+        self.height = self.math.as_ref().map_or_else(|| text.measure(self.handle).height_em(), |m| m.height()) * self.size;
         work.layout_requests += 1;
     }
 }
@@ -429,6 +430,7 @@ impl Preview {
             fonts: Vec::new(),
             paint_spans: Vec::new(),
             syntax_spans: Vec::new(),
+            math: None,
             paint: None,
             handle: ShapedHandle::INVALID,
             style,
@@ -440,6 +442,13 @@ impl Preview {
             faces,
             theme,
         });
+        if fresh || c.rich.math != e.rich.math || c.style != style || c.faces != faces {
+            c.math = e.rich.math.as_ref().map(|expr| {
+                let mut layout = crate::math::Layout::new(expr, text, base, 1.);
+                layout.fit(width / size);
+                layout
+            });
+        }
         let input_changed = fresh || c.rich.text != e.rich.text || c.fonts != fonts;
         let shape = input_changed || c.style != style || text.measure(c.handle).line_count() == 0;
         if input_changed {
@@ -478,7 +487,7 @@ impl Preview {
         if shape {
             c.shape(text, key, work);
         } else {
-            c.height = text.measure(c.handle).height_em() * size;
+            c.height = c.math.as_ref().map_or_else(|| text.measure(c.handle).height_em(), |m| m.height()) * size;
         }
         c.height
     }
@@ -898,6 +907,11 @@ impl Preview {
             if text.measure(c.handle).line_count() == 0 {
                 c.shape(text, key, &mut Work::default());
             }
+            if let Some(math) = &mut c.math {
+                math.draw(text, c.style.chain, at, c.size, c.color, viewport, &mut scene.draws, &mut scene.over);
+                scene.placed.push((id, at));
+                continue;
+            }
             scene.draws.push(Draw {
                 block: c.handle,
                 at,
@@ -966,6 +980,7 @@ impl Preview {
     pub fn hit_link(&self, scene: &Scene, point: Vec2, text: &TextService) -> Option<String> {
         for &(id, at) in &scene.placed {
             let c = &self.texts[&id];
+            if c.math.is_some() { continue; }
             if point.y < at.y || point.y > at.y + c.height || point.x < at.x {
                 continue;
             }
@@ -989,11 +1004,24 @@ impl Preview {
         None
     }
 
+    fn resolve_raw(c: &TextCache, doc: &Document, raw: usize) -> Option<usize> {
+        let i = c.origins.partition_point(|l| l.offset <= raw).saturating_sub(1);
+        let line = &c.origins[i];
+        doc.resolve(Origin { line: line.origin.line, column: line.origin.column + raw - line.offset })
+    }
+
     fn projected_selection(
         c: &TextCache,
         doc: &Document,
         range: &Range<usize>,
     ) -> Option<Range<usize>> {
+        if c.math.is_some() {
+            let first = c.rich.mapping.first()?;
+            let last = c.rich.mapping.last()?;
+            let start = Self::resolve_raw(c, doc, first.source.start)?;
+            let end = Self::resolve_raw(c, doc, last.source.end)?;
+            return (range.start < end && range.end > start).then_some(0..c.rich.text.len());
+        }
         let mut selected = None::<Range<usize>>;
         for (byte, grapheme) in c.rich.text.grapheme_indices(true) {
             let raw = c.rich.source_byte(byte);
@@ -1026,6 +1054,11 @@ impl Preview {
         for &(id, at) in &scene.placed {
             let c = &self.texts[&id];
             if let Some(range) = Self::projected_selection(c, doc, &range) {
+                if let Some(math) = &c.math {
+                    out.push(Decoration { rect: Rect::new(at.x, at.y, math.width*c.size, c.height),
+                        color: Color([0.025, 0.10, 0.19, 1.]) });
+                    continue;
+                }
                 for span in text.measure(c.handle).selection(range) {
                     out.push(Decoration {
                         rect: Rect::new(
@@ -1071,9 +1104,16 @@ impl Preview {
             let layout = text.measure(c.handle);
             let dy = (at.y - point.y).max(point.y - at.y - c.height).max(0.);
             let dx = (at.x - point.x)
-                .max(point.x - at.x - layout.width_em() * c.size)
+                .max(point.x - at.x - c.math.as_ref().map_or_else(|| layout.width_em(), |m| m.width) * c.size)
                 .max(0.);
             if closest.is_some_and(|(_, y, x)| dy > y || dy == y && dx >= x) {
+                continue;
+            }
+            if let Some(math) = &c.math {
+                let edge = if point.x < at.x + math.width*c.size*0.5 { 0 } else { c.rich.text.len() };
+                if let Some(byte) = Self::resolve_raw(c, doc, c.rich.source_byte(edge)) {
+                    closest = Some((byte, dy, dx));
+                }
                 continue;
             }
             let Some(hit) = layout.hit_test(Vec2::new(
@@ -1116,6 +1156,11 @@ impl Preview {
             {
                 continue;
             }
+            if let Some(math) = &c.math {
+                if point.x > at.x + math.width*c.size { continue; }
+                let edge = if point.x < at.x + math.width*c.size*0.5 { 0 } else { c.rich.text.len() };
+                return Self::resolve_raw(c, doc, c.rich.source_byte(edge));
+            }
             let hit = text.measure(c.handle).hit_test(Vec2::new(
                 (point.x - at.x) / c.size,
                 (point.y - at.y) / c.size,
@@ -1138,6 +1183,55 @@ impl Preview {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_math_uses_real_scripts_and_fraction_rules_with_atomic_source_selection() {
+        let (mut text, faces) = setup();
+        for source in ["[\nP(\\text{at least one lost}) = 1-(1-p)^n\n]", r"\[\frac{1}{n^2}\]", r"$$\sqrt{x_1}$$"] {
+            let doc = Document::new(source);
+            let mut view = Preview::new(911);
+            view.sync(&doc, &mut text, faces, Theme::default(), 400., 17.);
+            let scene = view.scene(&mut text, &doc, Rect::new(10., 20., 400., 200.), Vec2::new(0., 0.));
+            assert!(scene.draws.iter().any(|d| d.size < 17.), "scripts/fraction content actually scales");
+            assert!(scene.draws.len() > 1);
+            if source.contains("frac") || source.contains("sqrt") { assert!(!scene.over.is_empty()); }
+            let selection = view.selection(&scene, &text, &doc, 0..source.len());
+            assert_eq!(selection.len(), 1, "math is one atomic selectable source range");
+            let rect = selection[0].rect;
+            let point = Vec2::new(rect.x+rect.width*0.25, rect.y+rect.height*0.5);
+            let byte = view.hit_source(&scene, point, &text, &doc).unwrap();
+            assert!(source.is_char_boundary(byte));
+            assert!(view.nearest_source(&scene, point, &text, &doc).is_some());
+            assert!(!view.copy_selection(&doc, 0..source.len()).contains("\\text"));
+            let work = view.sync(&doc, &mut text, faces, Theme::default(), 400., 17.);
+            assert_eq!(work.layout_requests, 0);
+            assert_eq!(doc.source().to_string(), source);
+            view.release(&mut text);
+        }
+    }
+
+    #[test]
+    fn streamed_math_matches_cold_layout_and_real_fences_stay_literal() {
+        let (mut text, faces) = setup();
+        let source = "\\[\nP(\\text{at least one lost}) = 1-(1-p)^n\n\\]";
+        let mut doc = Document::default();
+        let mut view = Preview::new(912);
+        for (step, c) in source.chars().enumerate() {
+            doc.append(&c.to_string()).unwrap();
+            view.sync(&doc, &mut text, faces, Theme::default(), 250., 17.);
+            let fresh = Document::new(&doc.source().to_string());
+            let mut cold = Preview::new(913 + step as u32);
+            cold.sync(&fresh, &mut text, faces, Theme::default(), 250., 17.);
+            assert!((cold.height-view.height).abs() < 0.001, "source={:?}, cold={}, warm={}", doc.source().to_string(), cold.height, view.height);
+            assert_eq!(view.copy_selection(&doc, 0..doc.source().len_bytes()), cold.copy_selection(&fresh, 0..fresh.source().len_bytes()));
+            cold.release(&mut text);
+        }
+        view.release(&mut text);
+        let fenced = Document::new(&format!("```text\n{source}\n```"));
+        view.sync(&fenced, &mut text, faces, Theme::default(), 400., 17.);
+        assert!(view.texts.values().all(|c| c.math.is_none()));
+        assert!(view.copy_selection(&fenced, 0..fenced.source().len_bytes()).contains("\\text"));
+    }
 
     #[test]
     #[cfg(feature = "syntax")]
