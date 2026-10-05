@@ -166,6 +166,7 @@ pub(crate) fn regions(s: &str, code: &[(Range<usize>, Range<usize>)]) -> Vec<Reg
             else if tail.starts_with('$') && tail[1..].chars().next().is_some_and(|c| !c.is_whitespace() && c != '$') { Some((1, "$", true)) }
             else { None };
         if let Some((n, close, single)) = delimiter {
+            let previous_count = out.len();
             let start = i+n;
             let mut end = start;
             while end < s.len() && end-start <= MAX_BYTES {
@@ -182,7 +183,7 @@ pub(crate) fn regions(s: &str, code: &[(Range<usize>, Range<usize>)]) -> Vec<Reg
                 }
                 end += s[end..].chars().next().unwrap().len_utf8();
             }
-            if out.last().is_some_and(|r| r.full.end == i) { continue; }
+            if out.len() != previous_count { continue; }
         }
         if s.as_bytes()[i] == b'\\' { i += 1; if i == s.len() { break; } }
         i += s[i..].chars().next().unwrap().len_utf8();
@@ -279,6 +280,13 @@ mod tests {
         assert_eq!(parse(r"\frac{\alpha_1}{\sqrt{x^2}}").unwrap().plain(), "(α₁)/(√(x²))");
         for source in [r"\unknown{x}", r"\input{/etc/passwd}", "x^", "{x", "x}", "x^^2"] { assert!(parse(source).is_none(), "{source}"); }
         assert!(parse(&"{".repeat(1000)).is_none());
+    }
+    #[test]
+    fn adjacent_unfinished_math_always_makes_streaming_progress() {
+        for source in ["$x$$unfinished", "$$x$$$$", r"\(x\)\(unfinished", r"\[x\]$5"] {
+            assert_eq!(regions(source, &[]).len(), 1, "{source}");
+        }
+        assert_eq!(crate::markdown::inline::parse("$x$$unfinished").text, "x$unfinished");
     }
     #[test]
     fn delimiters_currency_escapes_and_code() {
