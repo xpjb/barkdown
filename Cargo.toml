@@ -1,0 +1,18 @@
+[package]
+name = "barkdown"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Woof. Incremental Markdown and syntax-highlighted Sanscale views."
+repository = "https://github.com/xpjb/barkdown"
+
+[dependencies]
+sanscale = { git = "https://github.com/xpjb/sanscale", rev = "8a290e9e121aa9992ea0e3b3de14188e3a2097f1" }
+ropey = { version = "1", default-features = false, features = ["simd"] }
+unicode-segmentation = "1"
+syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"], optional = true }
+
+[features]
+default = ["syntax"]
+syntax = ["dep:syntect"]
+perf-counters = ["sanscale/perf-counters"]
