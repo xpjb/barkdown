@@ -56,6 +56,7 @@ pub struct Element {
     pub origins: Vec<RawLine>,
 }
 impl Element {
+    pub(crate) fn raw_len(&self) -> usize { self.raw.len() }
     pub fn origin_at(&self, display: usize) -> Origin {
         let byte = self.rich.source_byte(display);
         let n = self

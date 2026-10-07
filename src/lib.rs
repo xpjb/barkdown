@@ -4,4 +4,4 @@ pub mod math;
 pub mod preview;
 pub mod syntax;
 pub use markdown::{Document, Stream};
-pub use preview::{Faces, Preview, Scene, Theme};
+pub use preview::{BlockSpacing, Faces, Preview, Scene, Theme};

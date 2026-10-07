@@ -194,8 +194,8 @@ impl ParagraphSource for Source<'_> {
     fn paragraph_fonts(&self, i: usize, _: ParagraphKey) -> Cow<'_, [FontSpan]> {
         let r = &self.parts[i];
         Cow::Owned(
-            self.fonts
-                .iter()
+            self.fonts[self.fonts.partition_point(|s| s.range.end <= r.start)..]
+                .iter().take_while(|s| s.range.start < r.end)
                 .filter_map(|s| {
                     let a = s.range.start.max(r.start);
                     let b = s.range.end.min(r.end);
@@ -208,6 +208,36 @@ impl ParagraphSource for Source<'_> {
         )
     }
 }
+// Paragraph identities describe actual text/font inputs, not the enclosing
+// Markdown element. Editing one line must not reshape an entire prose group.
+struct CachedParagraph {
+    key: ParagraphKey,
+    origin: Origin,
+    range: Range<usize>,
+    fonts: Vec<FontSpan>,
+    top_em: f32,
+}
+struct PreparedSource<'a> { rich: &'a RichText, paragraphs: &'a [CachedParagraph] }
+impl ParagraphSource for PreparedSource<'_> {
+    fn paragraph_text(&self, i: usize, _: ParagraphKey) -> Option<Cow<'_, str>> {
+        Some(Cow::Borrowed(&self.rich.text[self.paragraphs.get(i)?.range.clone()]))
+    }
+    fn paragraph_fonts(&self, i: usize, _: ParagraphKey) -> Cow<'_, [FontSpan]> {
+        Cow::Borrowed(&self.paragraphs[i].fonts)
+    }
+}
+
+/// Compact is the chat presentation; PreserveSource retains authored empty
+/// paragraphs and groups compatible prose in ordinary Sanscale blocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockSpacing { Compact, PreserveSource }
+
+struct ProseInput {
+    lines: Vec<(Id, u32)>,
+    rich: Arc<RichText>,
+    origins: Vec<RawLine>,
+}
+
 struct TextCache {
     rich: Arc<RichText>,
     origins: Vec<RawLine>,
@@ -218,7 +248,7 @@ struct TextCache {
     paint: Option<PaintHandle>,
     handle: ShapedHandle,
     style: Style,
-    generation: u32,
+    paragraphs: Vec<CachedParagraph>,
     size: f32,
     height: f32,
     flags: u8,
@@ -228,17 +258,14 @@ struct TextCache {
 }
 impl TextCache {
     fn shape(&mut self, text: &mut TextService, key: u64, work: &mut Work) {
-        let source = Source::new(&self.rich, &self.fonts);
-        let keys = (0..source.parts.len())
-            .map(|i| ParagraphKey {
-                namespace: key,
-                slot: i as u32,
-                generation: self.generation,
-            })
-            .collect::<Vec<_>>();
-        self.handle = text
-            .shape(BlockKey(key), &self.style, &keys, &source)
+        let source = PreparedSource { rich: &self.rich, paragraphs: &self.paragraphs };
+        let keys: Vec<_> = self.paragraphs.iter().map(|p| p.key).collect();
+        self.handle = text.shape(BlockKey(key), &self.style, &keys, &source)
             .expect("Markdown adapter emits valid grapheme-aligned font spans");
+        let layout = text.measure(self.handle);
+        for p in &mut self.paragraphs {
+            p.top_em = layout.caret_rect(layout.caret_at(p.range.start)).y_em;
+        }
         self.height = self.math.as_ref().map_or_else(|| text.measure(self.handle).height_em(), |m| m.height()) * self.size;
         work.layout_requests += 1;
     }
@@ -296,9 +323,112 @@ pub struct Preview {
     revision: Option<u64>,
     config: Option<(Faces, Theme, f32, f32)>,
     next_generation: u32,
+    body_style: Option<Style>,
+    spacing: BlockSpacing,
+    source_mode: bool,
+    prose: HashMap<Id, ProseInput>,
     pub height: f32,
     pub width: f32,
     pub last_work: Work,
+}
+fn ordinary(block: &md::Block) -> bool {
+    matches!(&block.content, Content::Text { kind: TextKind::Paragraph, element } if element.rich.math.is_none())
+}
+
+fn prose_input(doc: &Document, range: Range<usize>) -> ProseInput {
+    let mut rich = RichText::default(); let mut origins = Vec::new(); let mut raw_offset = 0;
+    let mut i = range.start;
+    let mut b = doc.blocks().partition_point(|b| b.lines.end <= i);
+    while i < range.end {
+        if i > range.start { rich.append(&RichText::literal("\n"), raw_offset); raw_offset += 1; }
+        if let Some(block) = doc.blocks().get(b).filter(|b| b.lines.start == i) {
+            let Content::Text { element, .. } = &block.content else { unreachable!() };
+            rich.append(&element.rich, raw_offset);
+            origins.extend(element.origins.iter().map(|o| RawLine { offset: o.offset+raw_offset, origin: o.origin }));
+            raw_offset += element.raw_len(); i = block.lines.end; b += 1;
+        } else {
+            let raw = doc.line_text(i).unwrap();
+            origins.push(RawLine { offset: raw_offset, origin: Origin { line: doc.line_key(i).unwrap().0, column: 0 } });
+            rich.append(&RichText::literal(raw), raw_offset);
+            raw_offset += raw.len(); i += 1;
+        }
+    }
+    ProseInput { lines: range.map(|i| doc.line_key(i).unwrap()).collect(), rich: Arc::new(rich), origins }
+}
+
+fn source_input(doc: &Document) -> ProseInput {
+    let raw = doc.source().to_string();
+    let mut rich = RichText::literal(&raw);
+    rich.runs.clear();
+    let mut offset = 0; let mut end = 0; let mut origins = Vec::new();
+    for (i, ranges) in source_code_ranges(doc, &raw).into_iter().enumerate() {
+        origins.push(RawLine { offset, origin: Origin { line: doc.line_key(i).unwrap().0, column: 0 } });
+        for r in ranges {
+            let a = offset+r.start; let b = offset+r.end;
+            if end < a { rich.runs.push(inline::Run { range: end..a, flags: 0 }); }
+            rich.runs.push(inline::Run { range: a..b, flags: inline::CODE }); end = b;
+        }
+        offset += doc.line_text(i).unwrap().len()+1;
+    }
+    if end < raw.len() { rich.runs.push(inline::Run { range: end..raw.len(), flags: 0 }); }
+    ProseInput { lines: Vec::new(), rich: Arc::new(rich), origins }
+}
+
+fn source_code_ranges(doc: &Document, raw: &str) -> Vec<Vec<Range<usize>>> {
+    use crate::markdown::{Content, Origin, inline::CODE};
+    let lines: Vec<_> = raw.split('\n').collect();
+    let mut starts = Vec::with_capacity(lines.len());
+    let mut offset = 0;
+    for line in &lines { starts.push(offset); offset += line.len()+1; }
+    let mut ranges = vec![Vec::<Range<usize>>::new(); lines.len()];
+    for block in doc.blocks() {
+        if matches!(block.content, Content::Code { .. }) {
+            for i in block.lines.clone() {
+                if let Some(line) = lines.get(i).filter(|line| !line.is_empty()) { ranges[i].push(0..line.len()); }
+            }
+            continue;
+        }
+        for element in block.elements() {
+            let resolve = |byte| {
+                let index = element.origins.partition_point(|line| line.offset <= byte).saturating_sub(1);
+                let line = element.origins.get(index)?;
+                doc.resolve(Origin { line: line.origin.line, column: line.origin.column+byte-line.offset })
+            };
+            for run in element.rich.runs.iter().filter(|r| r.flags & CODE != 0) {
+                let first = element.rich.mapping.partition_point(|m| m.display.end <= run.range.start);
+                for m in element.rich.mapping[first..].iter().take_while(|m| m.display.start < run.range.end) {
+                    let a = m.display.start.max(run.range.start);
+                    let b = m.display.end.min(run.range.end);
+                    let source = if m.exact { m.source.start+a-m.display.start..m.source.start+b-m.display.start }
+                        else { m.source.clone() };
+                    let (Some(a), Some(b)) = (resolve(source.start), resolve(source.end)) else { continue; };
+                    let mut i = starts.partition_point(|start| *start <= a).saturating_sub(1);
+                    while i < lines.len() && starts[i] < b {
+                        let start = a.saturating_sub(starts[i]);
+                        let end = (b-starts[i]).min(lines[i].len());
+                        if start < end { ranges[i].push(start..end); }
+                        i += 1;
+                    }
+                }
+            }
+        }
+    }
+    // A combining mark next to a backtick can share the marker's grapheme.
+    // Expand font roles to whole SOURCE graphemes; never emit invalid spans.
+    for (line, ranges) in lines.iter().zip(&mut ranges) {
+        ranges.sort_by_key(|r| r.start);
+        let mut normalized: Vec<Range<usize>> = Vec::new();
+        let mut cursor = 0;
+        for (at, g) in line.grapheme_indices(true) {
+            while ranges.get(cursor).is_some_and(|r| r.end <= at) { cursor += 1; }
+            if ranges.get(cursor).is_some_and(|r| r.start < at+g.len()) {
+                if let Some(last) = normalized.last_mut().filter(|r| r.end == at) { last.end = at+g.len(); }
+                else { normalized.push(at..at+g.len()); }
+            }
+        }
+        *ranges = normalized;
+    }
+    ranges
 }
 impl Preview {
     pub fn new(namespace: u32) -> Self {
@@ -316,6 +446,10 @@ impl Preview {
             revision: None,
             config: None,
             next_generation: 0,
+            body_style: None,
+            spacing: BlockSpacing::Compact,
+            source_mode: false,
+            prose: HashMap::new(),
             height: 0.,
             width: 0.,
             last_work: Work::default(),
@@ -331,6 +465,7 @@ impl Preview {
             }
         }
         self.texts.clear();
+        self.prose.clear();
         self.syntax.clear();
         self.blocks.clear();
         self.order.clear();
@@ -351,6 +486,12 @@ impl Preview {
         syntax: &[PaintSpan],
         work: &mut Work,
     ) -> f32 {
+        self.ensure_text(e.id, &e.rich, &e.origins, text, faces, theme, size, width, align, flags, syntax, work)
+    }
+    fn ensure_text(&mut self, id: Id, rich: &Arc<RichText>, origins: &[RawLine],
+        text: &mut TextService, faces: Faces, theme: Theme, size: f32, width: f32,
+        align: Align, flags: u8, syntax: &[PaintSpan], work: &mut Work,
+    ) -> f32 {
         let effective = |f| {
             if theme.italic {
                 f
@@ -361,12 +502,12 @@ impl Preview {
         let base = faces.face(effective(flags));
         let style = Style {
             chain: base,
-            wrap_em: Some((width / size).max(0.5)),
+            wrap_em: Some((width / size).max(0.)),
             align,
-            line_spacing: 1.25,
+            line_spacing: self.body_style.unwrap().line_spacing,
         };
-        if let Some(c) = self.texts.get_mut(&e.id) {
-            if Arc::ptr_eq(&c.rich, &e.rich)
+        if let Some(c) = self.texts.get_mut(&id) {
+            if Arc::ptr_eq(&c.rich, &rich)
                 && c.faces == faces
                 && c.theme == theme
                 && c.style == style
@@ -375,18 +516,18 @@ impl Preview {
                 && c.syntax_spans == syntax
                 && text.measure(c.handle).line_count() > 0
             {
-                c.origins = e.origins.clone();
+                c.origins = origins.to_vec();
                 return c.height;
             }
         }
         work.resolved_elements += 1;
         let mut fonts: Vec<FontSpan> = Vec::new();
         let mut run = 0;
-        for (at, g) in e.rich.text.grapheme_indices(true) {
-            while run < e.rich.runs.len() && e.rich.runs[run].range.end <= at {
+        for (at, g) in rich.text.grapheme_indices(true) {
+            while run < rich.runs.len() && rich.runs[run].range.end <= at {
                 run += 1;
             }
-            let f = e.rich.runs.get(run).map_or(flags, |r| flags | r.flags);
+            let f = rich.runs.get(run).map_or(flags, |r| flags | r.flags);
             let face = faces.face(effective(f));
             if face != base {
                 if let Some(last) = fonts
@@ -404,7 +545,7 @@ impl Preview {
         }
         let color = theme.role(flags);
         let mut paint_spans: Vec<PaintSpan> = Vec::new();
-        for r in &e.rich.runs {
+        for r in rich.runs.iter().filter(|_| !self.source_mode) {
             let c = theme.role(r.flags | flags);
             if c == color {
                 continue;
@@ -422,9 +563,9 @@ impl Preview {
             }
         }
         paint_spans.extend_from_slice(syntax);
-        let key = self.key(e.id);
-        let fresh = !self.texts.contains_key(&e.id);
-        let c = self.texts.entry(e.id).or_insert_with(|| TextCache {
+        let key = self.key(id);
+        let fresh = !self.texts.contains_key(&id);
+        let c = self.texts.entry(id).or_insert_with(|| TextCache {
             rich: Arc::new(RichText::default()),
             origins: Vec::new(),
             fonts: Vec::new(),
@@ -434,7 +575,7 @@ impl Preview {
             paint: None,
             handle: ShapedHandle::INVALID,
             style,
-            generation: 0,
+            paragraphs: Vec::new(),
             size,
             height: 0.,
             flags,
@@ -442,21 +583,34 @@ impl Preview {
             faces,
             theme,
         });
-        if fresh || c.rich.math != e.rich.math || c.style != style || c.faces != faces {
-            c.math = e.rich.math.as_ref().map(|expr| {
+        if fresh || c.rich.math != rich.math || c.style != style || c.faces != faces {
+            c.math = rich.math.as_ref().map(|expr| {
                 let mut layout = crate::math::Layout::new(expr, text, base, 1.);
                 layout.fit(width / size);
                 layout
             });
         }
-        let input_changed = fresh || c.rich.text != e.rich.text || c.fonts != fonts;
-        let shape = input_changed || c.style != style || text.measure(c.handle).line_count() == 0;
-        if input_changed {
-            self.next_generation = self
-                .next_generation
-                .checked_add(1)
-                .expect("Markdown view generation capacity");
-            c.generation = self.next_generation;
+        let input_changed = fresh || c.rich.text != rich.text || c.fonts != fonts;
+        let mut shape = input_changed || c.style != style || text.measure(c.handle).line_count() == 0;
+        {
+            let old: HashMap<_, _> = c.paragraphs.iter().map(|p| ((p.origin.line, p.origin.column), p)).collect();
+            let source = Source::new(rich, &fonts);
+            let paragraphs: Vec<CachedParagraph> = source.parts.iter().enumerate().map(|(i, range)| {
+                let raw = rich.source_byte(range.start);
+                let line = &origins[origins.partition_point(|l| l.offset <= raw).saturating_sub(1)];
+                let origin = Origin { line: line.origin.line, column: line.origin.column+raw-line.offset };
+                let fonts = source.paragraph_fonts(i, ParagraphKey { namespace: 0, slot: 0, generation: 0 }).into_owned();
+                let key = old.get(&(origin.line, origin.column)).filter(|p|
+                    c.rich.text[p.range.clone()] == rich.text[range.clone()] && p.fonts == fonts).map(|p| p.key)
+                    .unwrap_or_else(|| {
+                        self.next_generation = self.next_generation.checked_add(1).expect("Markdown paragraph capacity");
+                        ParagraphKey { namespace: key, slot: self.next_generation, generation: 0 }
+                    });
+                let top_em = old.get(&(origin.line, origin.column)).map_or(0., |p| p.top_em);
+                CachedParagraph { key, origin, range: range.clone(), fonts, top_em }
+            }).collect();
+            shape |= !c.paragraphs.iter().map(|p| p.key).eq(paragraphs.iter().map(|p| p.key));
+            c.paragraphs = paragraphs;
         }
         if c.paint_spans != paint_spans {
             let next = if paint_spans.is_empty() {
@@ -475,8 +629,8 @@ impl Preview {
             c.paint_spans = paint_spans;
         }
         c.syntax_spans = syntax.to_vec();
-        c.rich = e.rich.clone();
-        c.origins = e.origins.clone();
+        c.rich = rich.clone();
+        c.origins = origins.to_vec();
         c.fonts = fonts;
         c.style = style;
         c.size = size;
@@ -504,7 +658,7 @@ impl Preview {
     ) -> f32 {
         work.measured_rows += 1;
         let width = table.width / table.align.len() as f32;
-        let mut height = size * 1.25;
+        let mut height = size * self.body_style.unwrap().line_spacing;
         for (i, e) in row.cells.iter().enumerate() {
             let align = match table.align[i] {
                 md::Alignment::Left => Align::Left,
@@ -538,6 +692,20 @@ impl Preview {
         width: f32,
         size: f32,
     ) -> Work {
+        let style = Style { chain: faces.prose[0], wrap_em: Some(width/size), align: Align::Left, line_spacing: 1.25 };
+        self.sync_styled(doc, text, faces, theme, style, size, BlockSpacing::Compact)
+    }
+    /// Use the caller's text layout policy; no reader-only leading or gap in
+    /// PreserveSource mode. Markdown structure and inline spans remain derived.
+    pub fn sync_styled(&mut self, doc: &Document, text: &mut TextService, faces: Faces,
+        theme: Theme, style: Style, size: f32, spacing: BlockSpacing,
+    ) -> Work {
+        assert_eq!(style.chain, faces.prose[0], "body style must use the supplied prose face");
+        let width = style.wrap_em.expect("Markdown view needs a wrap width") * size;
+        if self.body_style != Some(style) || self.spacing != spacing || self.source_mode {
+            self.revision = None;
+        }
+        self.body_style = Some(style); self.spacing = spacing; self.source_mode = false;
         assert!(
             width.is_finite() && width > 0. && size.is_finite() && size > 0.,
             "positive finite Markdown viewport/font size"
@@ -599,6 +767,7 @@ impl Preview {
             });
         }
         for block in doc.blocks() {
+            if spacing == BlockSpacing::PreserveSource && ordinary(block) { continue; }
             if !all && !changed.contains(&block.id) && self.blocks.contains_key(&block.id) {
                 continue;
             }
@@ -759,7 +928,7 @@ impl Preview {
                             code: true,
                             marker: None,
                         },
-                        y.max(size * 1.25) + 12.,
+                        y.max(size * self.body_style.unwrap().line_spacing) + 12.,
                     )
                 }
                 Content::Rule => (LayoutContent::Rule, 12.),
@@ -773,13 +942,37 @@ impl Preview {
                 },
             );
         }
-        self.order = doc.blocks().iter().map(|b| b.id).collect();
+        self.order.clear();
+        let mut live_prose = HashSet::new();
+        if spacing == BlockSpacing::PreserveSource {
+            let mut start = 0;
+            for block in doc.blocks().iter().filter(|b| !ordinary(b)) {
+                self.prose_group(doc, start..block.lines.start, text, faces, theme, width, size, &mut work, &mut live_prose);
+                self.order.push(block.id); start = block.lines.end;
+            }
+            self.prose_group(doc, start..doc.line_count(), text, faces, theme, width, size, &mut work, &mut live_prose);
+        } else { self.order.extend(doc.blocks().iter().map(|b| b.id)); }
+        self.prose.retain(|id, _| live_prose.contains(id));
+        let live_blocks: HashSet<_> = self.order.iter().copied().collect();
+        self.blocks.retain(|id, _| live_blocks.contains(id));
+        let mut live_texts = HashSet::new();
+        for b in self.blocks.values() {
+            if let LayoutContent::Parts { items, .. } = &b.content { live_texts.extend(items.iter().map(|p| p.id)); }
+        }
+        for b in doc.blocks() {
+            if let Content::Table(t) = &b.content { live_texts.extend(t.rows.iter().flat_map(|r| r.cells.iter().map(|e| e.id))); }
+        }
+        self.texts.retain(|id, c| {
+            let keep = live_texts.contains(id);
+            if !keep && let Some(paint) = c.paint { text.drop_paint(paint); }
+            keep
+        });
         let mut y = 0.;
         self.width = width;
         for (index, id) in self.order.iter().enumerate() {
             // 8dp at the normal 16dp body size, like Tau 1. No phantom paragraph
             // gap at the bottom of every message/details fragment.
-            if index > 0 {
+            if index > 0 && spacing == BlockSpacing::Compact {
                 y += size * 0.5;
             }
             let b = self.blocks.get_mut(id).unwrap();
@@ -795,8 +988,71 @@ impl Preview {
         self.last_work = work;
         work
     }
+    fn prose_group(&mut self, doc: &Document, range: Range<usize>, text: &mut TextService,
+        faces: Faces, theme: Theme, width: f32, size: f32, work: &mut Work, live: &mut HashSet<Id>,
+    ) {
+        if range.is_empty() { return; }
+        let id = doc.line_key(range.start).unwrap().0;
+        live.insert(id);
+        let unchanged = self.prose.get(&id).is_some_and(|p|
+            p.lines.iter().copied().eq(range.clone().map(|i| doc.line_key(i).unwrap())));
+        if !unchanged { self.prose.insert(id, prose_input(doc, range)); }
+        let input = self.prose.remove(&id).unwrap();
+        let height = self.ensure_text(id, &input.rich, &input.origins, text, faces, theme, size, width,
+            self.body_style.unwrap().align, 0, &[], work);
+        self.prose.insert(id, input);
+        self.blocks.insert(id, BlockCache { y: 0., height, content: LayoutContent::Parts {
+            items: vec![Part { id, x: 0., y: 0. }], quote: false, code: false, marker: None,
+        } });
+        self.order.push(id);
+    }
+    /// Shape exact editable source with semantic code fonts. The caller keeps
+    /// using Sanscale's ShapedHandle/Layout for editing; there is no editor engine here.
+    pub fn sync_source(&mut self, doc: &Document, text: &mut TextService, faces: Faces,
+        style: Style, size: f32,
+    ) -> (ShapedHandle, Option<PaintHandle>) {
+        assert_eq!(style.chain, faces.prose[0], "body style must use the supplied prose face");
+        let id = doc.line_key(0).expect("source has an empty first line").0;
+        if self.document == Some(doc.identity()) && self.source_mode && self.revision == Some(doc.revision())
+            && self.body_style == Some(style) && let Some(c) = self.texts.get(&id)
+            && c.size == size && c.faces == faces && text.measure(c.handle).line_count() > 0 {
+            self.last_work = Work::default(); return (c.handle, c.paint);
+        }
+        if self.document != Some(doc.identity()) || !self.source_mode { self.release(text); }
+        self.document = Some(doc.identity()); self.source_mode = true;
+        self.body_style = Some(style);
+        if self.revision != Some(doc.revision()) || !self.prose.contains_key(&id) {
+            self.prose.insert(id, source_input(doc));
+        }
+        let input = self.prose.remove(&id).unwrap();
+        let syntax = self.syntax.source_spans(doc);
+        let mut work = Work::default();
+        self.height = self.ensure_text(id, &input.rich, &input.origins, text, faces, Theme::default(), size,
+            style.wrap_em.unwrap_or(f32::MAX/size)*size, style.align, 0, &syntax, &mut work);
+        self.prose.insert(id, input);
+        self.revision = Some(doc.revision()); self.last_work = work;
+        let c = &self.texts[&id];
+        self.width = text.measure(c.handle).width_em().max(style.wrap_em.unwrap_or(0.))*size;
+        self.config = Some((faces, Theme::default(), self.width, size));
+        self.order = vec![id];
+        self.blocks.insert(id, BlockCache { y: 0., height: self.height, content: LayoutContent::Parts {
+            items: vec![Part { id, x: 0., y: 0. }], quote: false, code: false, marker: None,
+        } });
+        (c.handle, c.paint)
+    }
     pub fn block_y(&self, id: Id) -> Option<f32> {
-        self.blocks.get(&id).map(|b| b.y)
+        if let Some(b) = self.blocks.get(&id) { return Some(b.y); }
+        for b in self.blocks.values() {
+            if let LayoutContent::Parts { items, .. } = &b.content {
+                for p in items {
+                    let c = &self.texts[&p.id];
+                    if let Some(line) = c.paragraphs.iter().find(|line| line.origin.line == id) {
+                        return Some(b.y+p.y+line.top_em*c.size);
+                    }
+                }
+            }
+        }
+        None
     }
     /// Only visible table rows are traversed. Draw clips are shared by the
     /// viewport, so many cells remain one batch/segment rather than N draw calls.
@@ -816,8 +1072,7 @@ impl Preview {
             rect: Rect::new(origin.x + x, origin.y + y, w, h),
             color,
         };
-        for block in doc.blocks() {
-            let id = block.id;
+        for &id in &self.order {
             let b = &self.blocks[&id];
             if b.y + b.height < scroll.y || b.y > scroll.y + viewport.height {
                 continue;
@@ -853,6 +1108,7 @@ impl Preview {
                     }
                 }
                 LayoutContent::Table(t) => {
+                    let block = doc.blocks().iter().find(|b| b.id == id).unwrap();
                     let Content::Table(model) = &block.content else {
                         unreachable!()
                     };
@@ -920,6 +1176,7 @@ impl Preview {
                 paint: c.paint,
                 clip: Some(viewport),
             });
+            if self.source_mode { scene.placed.push((id, at)); continue; }
             let layout = text.measure(c.handle);
             for r in &c.rich.runs {
                 let flags = r.flags | c.flags;
@@ -961,7 +1218,7 @@ impl Preview {
                 chain: self.config.unwrap().0.prose[0],
                 wrap_em: None,
                 align: Align::Left,
-                line_spacing: 1.25,
+                line_spacing: self.body_style.unwrap().line_spacing,
             };
             let block = text.shape_transient(&marker, &style).unwrap();
             scene.draws.push(Draw {
@@ -1076,13 +1333,22 @@ impl Preview {
     }
     pub fn copy_selection(&self, doc: &Document, range: Range<usize>) -> String {
         let mut out = Vec::new();
-        for block in doc.blocks() {
-            for element in block.elements() {
-                if let Some(c) = self.texts.get(&element.id)
-                    && let Some(range) = Self::projected_selection(c, doc, &range)
-                {
-                    out.push(c.rich.text[range].to_owned());
+        for id in &self.order {
+            match &self.blocks[id].content {
+                LayoutContent::Parts { items, .. } => {
+                    for p in items {
+                        let c = &self.texts[&p.id];
+                        if let Some(r) = Self::projected_selection(c, doc, &range) { out.push(c.rich.text[r].to_owned()); }
+                    }
                 }
+                LayoutContent::Table(_) => {
+                    let block = doc.blocks().iter().find(|b| b.id == *id).unwrap();
+                    for e in block.elements() {
+                        let c = &self.texts[&e.id];
+                        if let Some(r) = Self::projected_selection(c, doc, &range) { out.push(c.rich.text[r].to_owned()); }
+                    }
+                }
+                LayoutContent::Rule => {}
             }
         }
         out.join("\n")
@@ -1183,6 +1449,194 @@ impl Preview {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preserved_paragraphs_use_the_same_sanscale_geometry_as_source() {
+        let (mut text, faces) = setup();
+        let mut source = Preview::new(30000); let mut read = Preview::new(30001);
+        for raw in ["", "\n", "\n\n", "one\ntwo", "one\n\ntwo", "one\n\n\ntwo", "\none\n", " \n\t\n", "words WWW iii café 🙂 repeat and wrap\n\nsecond paragraph with words"] {
+            for width in [8., 90., 500.] {
+                for leading in [1., 1.25, 1.6] {
+                    let doc = Document::new(raw);
+                    let style = Style { chain: faces.prose[0], wrap_em: Some(width/17.), align: Align::Left, line_spacing: leading };
+                    let (edited, _) = source.sync_source(&doc, &mut text, faces, style, 17.);
+                    read.sync_styled(&doc, &mut text, faces, Theme::default(), style, 17., BlockSpacing::PreserveSource);
+                    let scene = read.scene(&mut text, &doc, Rect::new(0.,0.,width,5000.), Vec2::new(0.,0.));
+                    assert_eq!(scene.draws.len(), 1, "prose is one Sanscale block, not one per syntax paragraph");
+                    let a = text.measure(edited); let b = text.measure(scene.draws[0].block);
+                    assert_eq!(a.len_bytes(), b.len_bytes(), "{raw:?}");
+                    assert_eq!(a.line_count(), b.line_count());
+                    assert_eq!(a.height_em(), b.height_em());
+                    for byte in raw.grapheme_indices(true).map(|(i,_)| i).chain([raw.len()]) {
+                        let x = a.caret_rect(a.caret_at(byte)); let y = b.caret_rect(b.caret_at(byte));
+                        assert_eq!((x.x_em,x.y_em,x.height_em), (y.x_em,y.y_em,y.height_em), "{raw:?}, byte={byte}");
+                    }
+                    assert_eq!(read.copy_selection(&doc, 0..raw.len()), raw);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grouped_inline_projection_retains_links_source_hits_and_paragraph_boundaries() {
+        let (mut text, faces) = setup();
+        let raw = "\nfirst **bold** &amp; café\n\nsecond [link](https://example.org) `code`\n\n\n*not across\n\nparagraphs*\n";
+        let doc = Document::new(raw);
+        let mut view = Preview::new(30002);
+        let style = Style { chain: faces.prose[0], wrap_em: Some(40.), align: Align::Left, line_spacing: 1.4 };
+        view.sync_styled(&doc, &mut text, faces, Theme::default(), style, 17., BlockSpacing::PreserveSource);
+        let scene = view.scene(&mut text, &doc, Rect::new(0.,0.,680.,1000.), Vec2::new(0.,0.));
+        assert_eq!(scene.draws.len(), 1);
+        for block in doc.blocks() { assert!(view.block_y(block.id).is_some(), "grouping must retain syntax-block anchors"); }
+        assert_eq!(view.copy_selection(&doc, 0..raw.len()), "\nfirst bold & café\n\nsecond link code\n\n\n*not across\n\nparagraphs*\n");
+        let c = &view.texts[&view.order[0]];
+        for (display, source) in [("bold", "bold"), ("&", "&amp;"), ("link", "link"), ("code", "code"), ("paragraphs", "paragraphs")] {
+            let pos = c.rich.text.find(display).unwrap();
+            let caret = text.measure(c.handle).caret_rect(text.measure(c.handle).caret_at(pos));
+            let point = Vec2::new(caret.x_em*17.+0.01, (caret.y_em+caret.height_em*0.5)*17.);
+            assert_eq!(view.hit_source(&scene, point, &text, &doc), raw.find(source));
+            if display == "link" { assert_eq!(view.hit_link(&scene, point, &text).as_deref(), Some("https://example.org")); }
+        }
+        assert!(!view.selection(&scene, &text, &doc, raw.find("bold").unwrap()..raw.find("code").unwrap()+4).is_empty());
+    }
+
+    #[test]
+    fn paragraph_group_edits_keep_unchanged_paragraph_identities() {
+        let (mut text, faces) = setup();
+        let raw = (0..1000).map(|i| format!("paragraph {i}\n\n")).collect::<String>();
+        let mut doc = Document::new(&raw);
+        let style = Style { chain: faces.prose[0], wrap_em: Some(30.), align: Align::Left, line_spacing: 1.25 };
+        let mut read = Preview::new(30003); let mut source = Preview::new(30004);
+        read.sync_styled(&doc, &mut text, faces, Theme::default(), style, 17., BlockSpacing::PreserveSource);
+        source.sync_source(&doc, &mut text, faces, style, 17.);
+        let keys = |v: &Preview| v.texts[&doc.line_key(0).unwrap().0].paragraphs.iter().map(|p| p.key).collect::<Vec<_>>();
+        let before_read = keys(&read); let before_source = keys(&source);
+        let at = raw.find("paragraph 500").unwrap();
+        doc.edit(at..at+9, "altered").unwrap();
+        read.sync_styled(&doc, &mut text, faces, Theme::default(), style, 17., BlockSpacing::PreserveSource);
+        source.sync_source(&doc, &mut text, faces, style, 17.);
+        for (v, before) in [(&read, before_read), (&source, before_source)] {
+            let after = &v.texts[&doc.line_key(0).unwrap().0].paragraphs;
+            assert_eq!(after.len(), before.len());
+            assert_eq!(after.iter().zip(before).filter(|(a,b)| a.key != *b).count(), 1);
+        }
+        let work = read.sync_styled(&doc, &mut text, faces, Theme::default(), style, 17., BlockSpacing::PreserveSource);
+        assert_eq!(work.layout_requests, 0);
+        source.sync_source(&doc, &mut text, faces, style, 17.);
+        assert_eq!(source.last_work.layout_requests, 0);
+    }
+
+    #[test]
+    fn source_font_context_and_graphemes_are_preserved_by_shared_preparation() {
+        let (mut text, faces) = setup();
+        // Distinct supplied faces make font-role changes observable; system
+        // mono-family discovery is tested by the consuming application's suite.
+        let faces = Faces { mono: [faces.prose[1]; 4], ..faces };
+        let style = Style { chain: faces.prose[0], wrap_em: Some(80.), align: Align::Left, line_spacing: 1.25 };
+        for (case, raw) in ["before `é` after", "before `́x` after", "| a | `x\\|y` |\n| --- | --- |\n| b | c |", "before `multi\nline code` after", "```unknown\nWWWW iiii\n```\nordinary"].into_iter().enumerate() {
+            let doc = Document::new(raw); let mut view = Preview::new(30300+case as u32);
+            let (h, _) = view.sync_source(&doc, &mut text, faces, style, 17.);
+            assert_eq!(text.measure(h).len_bytes(), raw.len());
+            let scene = view.scene(&mut text, &doc, Rect::new(0.,0.,1360.,600.), Vec2::new(0.,0.));
+            assert_eq!(scene.draws.len(), 1); assert_eq!(scene.draws[0].block, h);
+            assert_eq!(view.copy_selection(&doc, 0..raw.len()), raw);
+            let c = &view.texts[&doc.line_key(0).unwrap().0];
+            assert!(c.fonts.iter().any(|f| f.chain == faces.mono[0]));
+            for p in &c.paragraphs {
+                let slice = &c.rich.text[p.range.clone()];
+                let bounds: Vec<_> = slice.grapheme_indices(true).map(|(i,_)| i).chain([slice.len()]).collect();
+                for f in &p.fonts { assert!(bounds.contains(&f.range.start) && bounds.contains(&f.range.end)); }
+            }
+            view.release(&mut text);
+        }
+        let mut doc = Document::new("```rust\nWWWW iiii\n```\nordinary WWW iii");
+        let mut view = Preview::new(30101);
+        view.sync_source(&doc, &mut text, faces, style, 17.);
+        let id = doc.line_key(0).unwrap().0;
+        let old: Vec<_> = view.texts[&id].paragraphs.iter().map(|p| p.key).collect();
+        doc.edit(3..7, "python").unwrap();
+        view.sync_source(&doc, &mut text, faces, style, 17.);
+        assert_eq!(view.texts[&id].paragraphs[1].key, old[1], "language changes only repaint unchanged code");
+        doc.edit(0..9, "intro").unwrap();
+        let (warm, _) = view.sync_source(&doc, &mut text, faces, style, 17.);
+        let c = &view.texts[&id];
+        assert_ne!(c.paragraphs[1].key, old[1]); assert_ne!(c.paragraphs[3].key, old[3]);
+        assert!(c.paragraphs[1].fonts.is_empty()); assert!(!c.paragraphs[3].fonts.is_empty());
+        let mut cold = Preview::new(30102);
+        let (fresh, _) = cold.sync_source(&doc, &mut text, faces, style, 17.);
+        assert_eq!(text.measure(warm).height_em(), text.measure(fresh).height_em());
+        for i in 0..text.measure(warm).line_count() {
+            assert_eq!(text.measure(warm).line(i).unwrap().width_em, text.measure(fresh).line(i).unwrap().width_em);
+        }
+    }
+
+    #[test]
+    fn preserved_mixed_blocks_and_middle_edits_match_cold_views() {
+        let (mut text, faces) = setup();
+        let mut doc = Document::new("\nprose **bold**\n\n# Heading\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n```rs\nlet x = 1;\n```\n\nafter\n");
+        let mut view = Preview::new(30200);
+        for (i, insert) in ["", "\n", "inserted\n\n", "**bold** &amp; "].iter().enumerate() {
+            doc.edit(0..0, insert).unwrap();
+            for width in [8., 30.] {
+                let style = Style { chain: faces.prose[0], wrap_em: Some(width), align: Align::Left, line_spacing: 1.37 };
+                view.sync_styled(&doc, &mut text, faces, Theme::default(), style, 17., BlockSpacing::PreserveSource);
+                let mut cold = Preview::new(30201+i as u32*2+u32::from(width > 10.));
+                cold.sync_styled(&doc, &mut text, faces, Theme::default(), style, 17., BlockSpacing::PreserveSource);
+                assert_eq!(view.height, cold.height);
+                let clip = Rect::new(0.,0.,width*17.,2000.);
+                let a = view.scene(&mut text, &doc, clip, Vec2::new(0.,0.));
+                let b = cold.scene(&mut text, &doc, clip, Vec2::new(0.,0.));
+                assert_eq!(a.draws.len(), b.draws.len());
+                for (a,b) in a.draws.iter().zip(&b.draws) {
+                    assert_eq!((a.at, a.size), (b.at, b.size));
+                    assert_eq!(text.measure(a.block).height_em(), text.measure(b.block).height_em());
+                }
+                assert_eq!(view.copy_selection(&doc, 0..doc.source().len_bytes()), cold.copy_selection(&doc, 0..doc.source().len_bytes()));
+                cold.release(&mut text);
+            }
+        }
+    }
+
+    #[test]
+    fn spaces_keep_positive_advance_across_stream_and_font_boundaries() {
+        let (mut text, faces) = setup();
+        let samples = [
+            "before **bold words joined here** after more normal words",
+            "before _italic words joined here_ after more normal words",
+            "before `code words joined here` after more normal words",
+            "before [link words joined here](https://example.org) after more normal words",
+            "before **bold _italic_ bold** after one two three four",
+            "first line ending in four words\nsecond line with four words",
+            "A repeated paragraph with ordinary spaces between words. ",
+            "normal café words 🙂 emoji words αβ math letters words",
+            "one two three four\n\nfive six seven eight\n\n**bold** and more words",
+            "| plain words here | **bold words here** |\n| --- | --- |\n| some more words | `more code words` |",
+        ];
+        for (sample_index, sample) in samples.iter().enumerate() {
+            for width in [130., 5000.] {
+                let mut doc = Document::default();
+                let mut view = Preview::new(20_000 + sample_index as u32*2 + u32::from(width > 200.));
+                // Split at every character, including whitespace and delimiter
+                // boundaries; assert geometry rather than merely copied text.
+                for chunk in sample.chars() {
+                    doc.append(&chunk.to_string()).unwrap();
+                    view.sync(&doc, &mut text, faces, Theme::default(), width, 17.);
+                    for c in view.texts.values() {
+                        let layout = text.measure(c.handle);
+                        for (byte, ch) in c.rich.text.char_indices().filter(|(_, c)| *c == ' ') {
+                            let a = layout.caret_at(byte); let b = layout.caret_at(byte+ch.len_utf8());
+                            let x = layout.caret_rect(a); let y = layout.caret_rect(b);
+                            if a.line_index == b.line_index && layout.line_range(a.line_index).is_some_and(|r| byte+1 < r.end) {
+                                assert!(y.x_em-x.x_em > 0.1, "space lost at byte {byte}: source={:?}, projected={:?}, width={width}, advance={}", doc.source().to_string(), c.rich.text, y.x_em-x.x_em);
+                            }
+                        }
+                    }
+                }
+                assert_eq!(doc.source().to_string(), *sample);
+                view.release(&mut text);
+            }
+        }
+    }
 
     #[test]
     fn display_math_uses_real_scripts_and_fraction_rules_with_atomic_source_selection() {

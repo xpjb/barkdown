@@ -52,6 +52,30 @@ syntax and incremental parsing bounds. This is a young API, not a full CommonMar
 conformance claim. Source markers remain visible in a source-preserving editor;
 `Preview` is the rendered Markdown path.
 
+## Source and rendered note layouts
+
+`Preview::sync` keeps the existing compact chat policy. Notes can pass their
+normal Sanscale `Style` to `sync_styled(..., style, size,
+BlockSpacing::PreserveSource)`. Its base chain must be `faces.prose[0]`, and its
+wrap width must be positive. Consecutive ordinary paragraphs and real empty lines
+share existing Sanscale blocks; inline fonts/paint remain spans. The adapter joins
+already-projected content with rebased origins, never reparses across paragraphs.
+Headings, code panels, tables and math retain their specialised structures.
+
+`Preview::sync_source(doc, text, faces, style, size)` prepares literal source with
+semantic code fonts through the **same** text-cache/paragraph shaping path and
+returns `(ShapedHandle, Option<PaintHandle>)`. Consumers keep Sanscale's existing
+measurement/caret/selection APIs, and may also use the view's scene/source-map
+queries. Supply separate views/namespaces for simultaneously displayed widths or
+presentations; share one Document. Per-paragraph identities include text/font
+inputs, so editing a line does not reshape the entire grouped note. Draw colors
+remain independent of layout. No new layout engine or Sanscale API is introduced.
+
+For plain text, both presentations have identical geometry, including repeated,
+leading and trailing empty lines. Markup removal and structural rendering can
+legitimately change dimensions. Caller typography is also the appropriate policy
+for any consumer-owned unstyled fallback.
+
 ## Provenance and pins
 
 Extracted from `xpjb/tau`'s `markdown/` at

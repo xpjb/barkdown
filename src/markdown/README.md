@@ -180,3 +180,14 @@ Tests include incremental/cold parser and layout equivalence, source mapping,
 selection/copy, tables, code paint, streaming math and citation fallback. Headless
 GPU consumer regressions live in Tau and Compendium; library tests use included,
 licensed deterministic DejaVu fonts. No font discovery or example UI is required.
+
+
+## View preparation
+
+Source and rendered note views reuse `Preview`'s Sanscale paragraph preparation.
+See the repository README for the APIs and explicit compact/preserve-source
+spacing policies. Grouping is a view operation, not a parser change: semantic
+paragraph boundaries remain intact, and authored blank lines remain available
+through the Document's physical-line identities. Paragraph generations reflect
+actual text/font changes, while source-origin refreshes and paint changes need
+not reshape glyphs. Tests cover grouped source maps and cold/incremental equality.

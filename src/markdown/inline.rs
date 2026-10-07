@@ -40,6 +40,17 @@ impl RichText {
         out.push(source, 0, 0..source.len(), true);
         out
     }
+    /// Concatenate already-projected input; never reparse across Markdown
+    /// paragraph boundaries. Coordinates in `other` are local to its raw source.
+    pub(crate) fn append(&mut self, other: &Self, raw_offset: usize) {
+        let display = self.text.len();
+        self.text.push_str(&other.text);
+        self.runs.extend(other.runs.iter().map(|r| Run { range: r.range.start+display..r.range.end+display, flags: r.flags }));
+        self.mapping.extend(other.mapping.iter().map(|m| Mapping { display: m.display.start+display..m.display.end+display,
+            source: m.source.start+raw_offset..m.source.end+raw_offset, exact: m.exact }));
+        self.links.extend(other.links.iter().map(|l| Link { source: l.source.start+raw_offset..l.source.end+raw_offset,
+            destination: l.destination.clone() }));
+    }
     pub fn same_pixels(&self, other: &Self) -> bool {
         self.text == other.text && self.runs == other.runs && self.math == other.math
     }
