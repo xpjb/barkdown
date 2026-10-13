@@ -506,8 +506,9 @@ impl Preview {
             align,
             line_spacing: self.body_style.unwrap().line_spacing,
         };
+        let key = self.key(id);
         if let Some(c) = self.texts.get_mut(&id) {
-            if Arc::ptr_eq(&c.rich, &rich)
+            if Arc::ptr_eq(&c.rich, rich)
                 && c.faces == faces
                 && c.theme == theme
                 && c.style == style
@@ -521,6 +522,32 @@ impl Preview {
             }
         }
         work.resolved_elements += 1;
+        if let Some(c) = self.texts.get_mut(&id)
+            && Arc::ptr_eq(&c.rich, rich)
+            && c.faces == faces
+            && c.theme == theme
+            && c.flags == flags
+            && c.syntax_spans == syntax
+        {
+            let shape = c.style != style || text.measure(c.handle).line_count() == 0;
+            if c.style != style {
+                c.math = rich.math.as_ref().map(|expr| {
+                    let mut layout = crate::math::Layout::new(expr, text, base, 1.);
+                    layout.fit(width / size);
+                    layout
+                });
+            }
+            c.origins = origins.to_vec();
+            c.style = style;
+            c.size = size;
+            if shape {
+                c.shape(text, key, work);
+            } else {
+                c.height = c.math.as_ref()
+                    .map_or_else(|| text.measure(c.handle).height_em(), |m| m.height()) * size;
+            }
+            return c.height;
+        }
         let mut fonts: Vec<FontSpan> = Vec::new();
         let mut run = 0;
         for (at, g) in rich.text.grapheme_indices(true) {
@@ -563,7 +590,6 @@ impl Preview {
             }
         }
         paint_spans.extend_from_slice(syntax);
-        let key = self.key(id);
         let fresh = !self.texts.contains_key(&id);
         let c = self.texts.entry(id).or_insert_with(|| TextCache {
             rich: Arc::new(RichText::default()),
@@ -1498,6 +1524,33 @@ mod tests {
             if display == "link" { assert_eq!(view.hit_link(&scene, point, &text).as_deref(), Some("https://example.org")); }
         }
         assert!(!view.selection(&scene, &text, &doc, raw.find("bold").unwrap()..raw.find("code").unwrap()+4).is_empty());
+    }
+
+    #[test]
+    fn width_only_reflow_reuses_resolved_paragraph_inputs() {
+        let (mut text, faces) = setup();
+        let raw = "ordinary **bold words** and `code words` ".repeat(200);
+        let doc = Document::new(&raw);
+        let mut view = Preview::new(30005);
+        let style = Style { chain: faces.prose[0], wrap_em: Some(40.), align: Align::Left, line_spacing: 1.25 };
+        view.sync_styled(&doc, &mut text, faces, Theme::default(), style, 17., BlockSpacing::PreserveSource);
+        let id = view.order[0];
+        let fonts = view.texts[&id].fonts.as_ptr();
+        let paragraphs = view.texts[&id].paragraphs.as_ptr();
+        let paint = view.texts[&id].paint;
+        let work = view.sync_styled(
+            &doc,
+            &mut text,
+            faces,
+            Theme::default(),
+            Style { wrap_em: Some(30.), ..style },
+            17.,
+            BlockSpacing::PreserveSource,
+        );
+        assert_eq!(work.layout_requests, 1);
+        assert_eq!(view.texts[&id].fonts.as_ptr(), fonts);
+        assert_eq!(view.texts[&id].paragraphs.as_ptr(), paragraphs);
+        assert_eq!(view.texts[&id].paint, paint);
     }
 
     #[test]
