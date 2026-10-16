@@ -86,9 +86,8 @@ and baseline-relative underline fixes are retained. MIT OR Apache-2.0;
 both license texts are included. Deterministic DejaVu test fonts carry their own
 license in `tests/fonts/`; production fonts are supplied by each app.
 
-Sanscale is pinned to `15ad1f03e17a368e2ff4f1b269f60bad13483638` (master as
-verified October 5, 2026), including prepared-text residency fix `4325844` and source-preserving tab advances.
-Consumers must use the same Git source/revision to share one TextService type.
+Sanscale is pinned to `c9f70ad7c500ffc91ae448d82a52aca963f0ee72` (master as
+verified October 16, 2026), including prepared-text residency, source-preserving tab advances, linear width reflow, and GLAM 0.30 alignment. Consumers must use the same Git source/revision to share one TextService type.
 
 ## Checks
 

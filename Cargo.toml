@@ -7,7 +7,7 @@ description = "Woof. Incremental Markdown and syntax-highlighted Sanscale views.
 repository = "https://github.com/xpjb/barkdown"
 
 [dependencies]
-sanscale = { git = "https://github.com/xpjb/sanscale", rev = "fa8fa035f2bae05e6a8f040f2c2d8d39f6653f70" }
+sanscale = { git = "https://github.com/xpjb/sanscale", rev = "c9f70ad7c500ffc91ae448d82a52aca963f0ee72" }
 ropey = { version = "1", default-features = false, features = ["simd"] }
 unicode-segmentation = "1"
 syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"], optional = true }
